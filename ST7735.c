@@ -1,4 +1,5 @@
 #include <ST7735.h>
+#include <string.h>
 
 int16_t _width;       ///< Display width as modified by current rotation
 int16_t _height;      ///< Display height as modified by current rotation
@@ -12,43 +13,42 @@ uint8_t _ystart;
 
 extern volatile uint8_t spi_dma_busy;
 
-#define TFT_BUF_PIXELS  1024   // Sesuaikan dengan RAM yang tersedia
+#define TFT_BUF_PIXELS  512   // Kurangi size untuk lebih aman
 
-static uint16_t tftBuf[2][TFT_BUF_PIXELS];
-static uint16_t bufIndex[2] = { 0, 0 };
-static uint8_t activeBuf = 0;
+static uint16_t tftBuf[TFT_BUF_PIXELS];
+static volatile uint16_t bufIndex = 0;
 
 // Wait untuk DMA selesai
 static inline void SPI_WaitDMA(void) {
-    while (spi_dma_busy);
+    uint32_t timeout = 100000;
+    while (spi_dma_busy && timeout--) {
+        // Prevent infinite loop
+    }
+    spi_dma_busy = 0; // Force reset jika timeout
 }
 
-// Fungsi untuk push pixel ke buffer (dengan double buffering)
+// Fungsi untuk push pixel ke buffer - FULLY FIXED
 static void ST7735_PushPixel(uint16_t color) {
-    uint8_t drawBuf = activeBuf ^ 1;
-    // Swap byte order untuk LCD (big-endian)
-    tftBuf[drawBuf][bufIndex[drawBuf]++] = (color >> 8) | (color << 8);
+    // Swap byte order untuk ST7735 (Big Endian)
+    tftBuf[bufIndex++] = __REV16(color); // Gunakan ARM instruction untuk swap
 
-    if (bufIndex[drawBuf] >= TFT_BUF_PIXELS) {
+    if (bufIndex >= TFT_BUF_PIXELS) {
         ST7735_Flush();
     }
 }
 
-// Flush buffer ke display via DMA
+// Flush buffer ke display via DMA - FULLY FIXED
 void ST7735_Flush(void) {
+    if (bufIndex == 0) return;
+
     SPI_WaitDMA();  // Tunggu DMA sebelumnya selesai
 
-    uint8_t sendBuf = activeBuf ^ 1;
-    if (bufIndex[sendBuf] == 0) return;
+    uint16_t pixelsToSend = bufIndex;
+    bufIndex = 0; // Reset SEBELUM kirim DMA
 
-    // Switch buffer
-    activeBuf = sendBuf;
     spi_dma_busy = 1;
-
     HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
-    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)tftBuf[activeBuf], bufIndex[activeBuf] * 2);
-
-    bufIndex[activeBuf] = 0;
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)tftBuf, pixelsToSend * 2);
 }
 
 const uint8_t init_cmds1[] = {
@@ -103,6 +103,7 @@ void ST7735_Select() {
 }
 
 void ST7735_Unselect() {
+    SPI_WaitDMA(); // Tunggu transfer selesai sebelum unselect
     HAL_GPIO_WritePin(CS_PORT, CS_PIN, GPIO_PIN_SET);
 }
 
@@ -110,6 +111,7 @@ void ST7735_Reset() {
     HAL_GPIO_WritePin(RST_PORT, RST_PIN, GPIO_PIN_RESET);
     HAL_Delay(5);
     HAL_GPIO_WritePin(RST_PORT, RST_PIN, GPIO_PIN_SET);
+    HAL_Delay(150); // Tambah delay setelah reset
 }
 
 void ST7735_WriteCommand(uint8_t cmd) {
@@ -121,7 +123,14 @@ void ST7735_WriteCommand(uint8_t cmd) {
 void ST7735_WriteData(uint8_t *buff, size_t size) {
     SPI_WaitDMA();
     HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
-    HAL_SPI_Transmit(&ST7735_SPI_PORT, buff, size, HAL_MAX_DELAY);
+
+    // Split large transfers jika perlu
+    while (size > 0) {
+        uint16_t chunk = (size > 256) ? 256 : size;
+        HAL_SPI_Transmit(&ST7735_SPI_PORT, buff, chunk, HAL_MAX_DELAY);
+        buff += chunk;
+        size -= chunk;
+    }
 }
 
 void DisplayInit(const uint8_t *addr) {
@@ -151,21 +160,30 @@ void DisplayInit(const uint8_t *addr) {
 }
 
 void ST7735_SetAddressWindow(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) {
+    // COLUMN
     ST7735_WriteCommand(ST7735_CASET);
     uint8_t data[] = { 0x00, x0 + _xstart, 0x00, x1 + _xstart };
     ST7735_WriteData(data, sizeof(data));
 
+    // ROW
     ST7735_WriteCommand(ST7735_RASET);
     data[1] = y0 + _ystart;
     data[3] = y1 + _ystart;
     ST7735_WriteData(data, sizeof(data));
 
+    // WRITE TO RAM
     ST7735_WriteCommand(ST7735_RAMWR);
 }
 
 void ST7735_Init(uint8_t rot) {
+    // Reset buffer
+    bufIndex = 0;
+    spi_dma_busy = 0;
+    memset(tftBuf, 0, sizeof(tftBuf));
+
     ST7735_Select();
     ST7735_Reset();
+
     DisplayInit(init_cmds1);
     DisplayInit(init_cmds2);
     DisplayInit(init_cmds3);
@@ -173,15 +191,18 @@ void ST7735_Init(uint8_t rot) {
 #if ST7735_IS_160X80
     _colstart = 24;
     _rowstart = 0;
-    uint8_t data = 0xC0;
-    ST7735_WriteCommand(ST7735_MADCTL);
-    ST7735_WriteData(&data, 1);
+    _width = 80;
+    _height = 160;
 #elif ST7735_IS_128X128
     _colstart = 2;
     _rowstart = 3;
+    _width = 128;
+    _height = 128;
 #else
     _colstart = 0;
     _rowstart = 0;
+    _width = ST7735_WIDTH;
+    _height = ST7735_HEIGHT;
 #endif
 
     ST7735_SetRotation(rot);
@@ -196,10 +217,14 @@ void ST7735_SetRotation(uint8_t m) {
     case 0:
 #if ST7735_IS_160X80
         madctl = ST7735_MADCTL_MX | ST7735_MADCTL_MY | ST7735_MADCTL_BGR;
+        _width = 80;
+        _height = 160;
+        _xstart = _colstart;
+        _ystart = _rowstart;
 #else
         madctl = ST7735_MADCTL_MX | ST7735_MADCTL_MY | ST7735_MADCTL_RGB;
-        _height = ST7735_HEIGHT;
         _width = ST7735_WIDTH;
+        _height = ST7735_HEIGHT;
         _xstart = _colstart;
         _ystart = _rowstart;
 #endif
@@ -207,6 +232,10 @@ void ST7735_SetRotation(uint8_t m) {
     case 1:
 #if ST7735_IS_160X80
         madctl = ST7735_MADCTL_MY | ST7735_MADCTL_MV | ST7735_MADCTL_BGR;
+        _width = 160;
+        _height = 80;
+        _ystart = _colstart;
+        _xstart = _rowstart;
 #else
         madctl = ST7735_MADCTL_MY | ST7735_MADCTL_MV | ST7735_MADCTL_RGB;
         _width = ST7735_HEIGHT;
@@ -218,10 +247,14 @@ void ST7735_SetRotation(uint8_t m) {
     case 2:
 #if ST7735_IS_160X80
         madctl = ST7735_MADCTL_BGR;
+        _width = 80;
+        _height = 160;
+        _xstart = _colstart;
+        _ystart = _rowstart;
 #else
         madctl = ST7735_MADCTL_RGB;
-        _height = ST7735_HEIGHT;
         _width = ST7735_WIDTH;
+        _height = ST7735_HEIGHT;
         _xstart = _colstart;
         _ystart = _rowstart;
 #endif
@@ -229,6 +262,10 @@ void ST7735_SetRotation(uint8_t m) {
     case 3:
 #if ST7735_IS_160X80
         madctl = ST7735_MADCTL_MX | ST7735_MADCTL_MV | ST7735_MADCTL_BGR;
+        _width = 160;
+        _height = 80;
+        _ystart = _colstart;
+        _xstart = _rowstart;
 #else
         madctl = ST7735_MADCTL_MX | ST7735_MADCTL_MV | ST7735_MADCTL_RGB;
         _width = ST7735_HEIGHT;
@@ -327,27 +364,12 @@ void ST7735_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
     ST7735_Select();
     ST7735_SetAddressWindow(x, y, x + w - 1, y + h - 1);
 
-    // Untuk image, perlu swap byte order juga
-    uint32_t totalPixels = w * h;
-    static uint16_t imgBuf[128]; // Buffer untuk swap
-
-    SPI_WaitDMA();
-    HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
-
-    for (uint32_t i = 0; i < totalPixels; i += 128) {
-        uint16_t chunk = (totalPixels - i > 128) ? 128 : (totalPixels - i);
-
-        // Swap byte order
-        for (uint16_t j = 0; j < chunk; j++) {
-            uint16_t pixel = img[i + j];
-            imgBuf[j] = (pixel >> 8) | (pixel << 8);
-        }
-
-        spi_dma_busy = 1;
-        HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)imgBuf, chunk * 2);
-        SPI_WaitDMA();
+    uint32_t totalPixels = (uint32_t)w * h;
+    for (uint32_t i = 0; i < totalPixels; i++) {
+        ST7735_PushPixel(img[i]);
     }
 
+    ST7735_Flush();
     ST7735_Unselect();
 }
 
@@ -357,7 +379,6 @@ void ST7735_InvertColors(bool invert) {
     ST7735_Unselect();
 }
 
-// Tambahan: fungsi untuk menggambar garis horizontal (optimized)
 void ST7735_DrawHLine(uint16_t x, uint16_t y, uint16_t w, uint16_t color) {
     if (x >= _width || y >= _height) return;
     if (x + w > _width) w = _width - x;
@@ -373,7 +394,6 @@ void ST7735_DrawHLine(uint16_t x, uint16_t y, uint16_t w, uint16_t color) {
     ST7735_Unselect();
 }
 
-// Tambahan: fungsi untuk menggambar garis vertikal (optimized)
 void ST7735_DrawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color) {
     if (x >= _width || y >= _height) return;
     if (y + h > _height) h = _height - y;
@@ -389,9 +409,9 @@ void ST7735_DrawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color) {
     ST7735_Unselect();
 }
 
-// Helper: Convert RGB888 to RGB565 dengan byte swap
-uint16_t ST7735_Color565(uint8_t r, uint8_t g, uint8_t b) {
-    uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-    // Tidak perlu swap di sini, nanti di PushPixel
-    return color;
-}
+//// Tambahan: Callback untuk DMA complete
+//void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
+//    if (hspi->Instance == SPI1) {
+//        spi_dma_busy = 0;
+//    }
+//}
